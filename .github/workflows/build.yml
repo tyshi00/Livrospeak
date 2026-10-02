@@ -1,0 +1,66 @@
+﻿name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Point Gradle at the Android SDK
+        run: echo "sdk.dir=$ANDROID_HOME" > local.properties
+
+      - name: Grant execute permission to gradlew
+        run: chmod +x gradlew
+
+      - name: Build debug APK
+        env:
+          GITHUB_ACTOR: ${{ github.repository_owner }}
+          GITHUB_TOKEN: ${{ secrets.LIGHTPHONE_PACKAGES_TOKEN }}
+        run: ./gradlew assembleDebug --console=plain
+
+      - name: Read version from app/build.gradle.kts
+        id: version
+        run: |
+          version=$(grep -oP '(?<=versionName = ")[^"]+' app/build.gradle.kts)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "App version: $version"
+
+      - name: Rename APK to include version
+        run: |
+          apkfile=$(find app/build/outputs/apk/debug -name "*.apk" | head -1)
+          cp "$apkfile" "livrospeak-${{ steps.version.outputs.version }}-debug.apk"
+          ls -la livrospeak-*.apk
+
+      - name: Upload APK artifact (available for all builds)
+        uses: actions/upload-artifact@v4
+        with:
+          name: livrospeak-debug-apk
+          path: livrospeak-*.apk
+
+      - name: Create GitHub Release (manual dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: v${{ steps.version.outputs.version }}
+          files: livrospeak-*.apk
+          prerelease: true
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
