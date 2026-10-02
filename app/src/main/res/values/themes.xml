@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      Cold-start splash theme (minSdk 33, so the platform SplashScreen API
+      applies directly; no androidx compat library needed).
+
+      windowSplashScreenAnimatedIcon is explicitly set to transparent so the
+      OS shows a plain black screen instead of its default behavior of
+      blowing up the launcher icon on the splash. There is no
+      postSplashScreenTheme item here on purpose: that attribute belongs to
+      the separate androidx compat splash library (which Livrospeak doesn't
+      depend on) and doesn't exist on plain Android; it isn't needed here
+      either, since this style already extends the same theme
+      (Theme.Black.NoTitleBar) the activity uses for the rest of its life,
+      so there's no separate theme to switch to once the splash overlay is
+      dismissed. That dismissal happens as soon as MainActivity's first
+      frame is ready; MainActivity does no blocking work before setContent,
+      so this is already the shortest the system lets a cold start be.
+      There is no separate "duration" setting to turn down further without
+      adding a fake artificial delay, which would make startup slower, not
+      faster.
+    -->
+    <style name="Theme.Livrospeak.Starting" parent="@android:style/Theme.Black.NoTitleBar">
+        <item name="android:windowSplashScreenBackground">@android:color/black</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@android:color/transparent</item>
+    </style>
+</resources>
