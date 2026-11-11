@@ -30,8 +30,8 @@ android {
         applicationId = "com.tyshi00.livrospeak"
         minSdk = 33
         targetSdk = 34
-        versionCode = 34
-        versionName = "1.0.0"
+        versionCode = 35
+        versionName = "1.1.0"
     }
 
     signingConfigs {

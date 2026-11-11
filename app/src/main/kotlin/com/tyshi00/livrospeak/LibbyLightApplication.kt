@@ -9,6 +9,7 @@ import com.tyshi00.livrospeak.library.ListeningSessionStore
 import com.tyshi00.livrospeak.library.LivrospeakSettingsStore
 import com.tyshi00.livrospeak.library.RssFeedRepository
 import com.tyshi00.livrospeak.library.RssDownloadManager
+import com.tyshi00.livrospeak.library.LibrivoxDownloadManager
 import com.tyshi00.livrospeak.player.LocalPlaybackController
 import com.tyshi00.livrospeak.ui.LightThemeController
 
@@ -23,6 +24,7 @@ class LibbyLightApplication : Application() {
         LibraryCardPinStore.init(this)
         RssFeedRepository.init(this)
         RssDownloadManager.init(this)
+        LibrivoxDownloadManager.init(this)
         LocalBookRepository.init(this)
         LocalPlaybackController.init(this)
 

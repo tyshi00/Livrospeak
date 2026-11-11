@@ -482,7 +482,23 @@ object LibbyWebPlayer {
                     // doubles as the hold's status text ("Ready for borrowing...",
                     // "Estimated wait...", "#N in line...").
                     const status = (tile.querySelector('.title-tile-journey-link')?.textContent || '').trim();
-                    const isReady = /ready/i.test(status);
+                    // A real device report showed a hold the person confirmed WAS ready
+                    // still coming back with isReady=false from the /ready/i check below
+                    // -- Libby's actual status copy for a ready hold apparently doesn't
+                    // always contain the literal word "ready". Rather than guess at
+                    // another string to match, this now primarily asks the one thing
+                    // that actually matters: does this tile have a clickable Borrow (or
+                    // Place a Hold) button right now? That's the exact same button
+                    // borrowOrHoldSearchResult's own click script looks for, so "ready"
+                    // here means the same thing it means when actually clicking Borrow
+                    // -- the /ready/i text check is kept only as a fallback in case a
+                    // future Libby layout renders the button differently than this.
+                    const tileButtons = Array.from(tile.querySelectorAll('button, a'));
+                    const hasBorrowButton = tileButtons.some((el) => {
+                        const text = String(el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                        return text === 'borrow' || text === 'place hold' || text === 'place a hold';
+                    });
+                    const isReady = hasBorrowButton || /ready/i.test(status);
 
                     return { title, author, cardId, titleId, coverUrl: cover, status, isReady };
                 }).filter(item => item.title && item.titleId);
@@ -673,6 +689,133 @@ object LibbyWebPlayer {
                 val match = holds.firstOrNull { it.cardId == cardId && it.titleId == titleId }
                 continuation.resume(match?.status?.contains("suspend", ignoreCase = true) == true)
             }
+        }
+    }
+
+    /**
+     * Borrows a hold that's ready for checkout. A ready hold's tile on /shelf/holds uses
+     * the same `.title-tile` markup (and the same "Borrow" button) as a search result's
+     * tile, so step 1 below (find+click that button) is the same script
+     * [borrowOrHoldSearchResult] uses. Everything after that is its own tailored flow
+     * instead of delegating to [borrowOrHoldSearchResult] wholesale: a real device test
+     * showed that flow's step 2 (wait for a `/request?key=...` URL) timing out --
+     * "Never reached Libby's confirmation screen" -- for a HOLD being converted, even
+     * though the tile click itself succeeded. Converting a ready hold most likely
+     * completes in place (an AJAX/modal confirmation) rather than navigating to that
+     * review screen the way a fresh search result's borrow does, so waiting on that
+     * URL is the wrong signal here.
+     *
+     * Instead this opportunistically tries the same review-screen confirm click
+     * [borrowOrHoldSearchResult] uses IF that screen happens to appear, but never
+     * blocks or fails on it -- then judges success the same proven way
+     * [cancelHold]/[suspendHold] already do on this exact page: re-scrape
+     * /shelf/holds and check whether this cardId+titleId is gone (borrowed holds
+     * move to the Loans shelf, same as a cancelled hold simply disappearing).
+     */
+    suspend fun borrowHold(cardId: String, titleId: String): Pair<Boolean, String> {
+        if (!requireWebView().url.orEmpty().contains("/shelf/holds")) {
+            loadHoldsPage()
+            delay(1200)
+        }
+        scrollToBottom()
+        delay(400)
+
+        // Step 1: find and click the tile's own Borrow/Place a Hold button. Same
+        // script and same retry-for-a-few-seconds reasoning as
+        // borrowOrHoldSearchResult's own step 1 (a tile can render in a stale state
+        // briefly after a navigation).
+        val clickTileScript = """
+            (() => {
+                const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+                const tiles = Array.from(document.querySelectorAll('.title-tile'));
+                const tile = tiles.find(t => (t.className || '').includes('data-title_$titleId'));
+                if (!tile) return JSON.stringify({ found: false, actionText: '' });
+                const buttons = Array.from(tile.querySelectorAll('button, a'));
+                const target = buttons.find((el) => {
+                    const text = clean(el.textContent).toLowerCase();
+                    return text === 'borrow' || text === 'place hold' || text === 'place a hold';
+                });
+                if (!target) return JSON.stringify({ found: false, actionText: '' });
+                const actionText = clean(target.textContent);
+                target.click();
+                return JSON.stringify({ found: true, actionText });
+            })();
+        """.trimIndent()
+        var tileClick: JSONObject? = null
+        for (attempt in 0 until 8) {
+            tileClick = evaluateJs(clickTileScript)?.let { runCatching { JSONObject(it) }.getOrNull() }
+            if (tileClick?.optBoolean("found") == true) break
+            delay(500)
+        }
+        var actionText = tileClick?.optString("actionText").orEmpty().ifBlank { "Borrow" }
+        if (tileClick?.optBoolean("found") != true) {
+            return false to "Couldn't find a Borrow button on this hold"
+        }
+
+        // Step 2 (opportunistic, non-blocking): if Libby DOES navigate to the
+        // /request review screen the way a fresh search result's borrow does,
+        // click its confirm button the same way borrowOrHoldSearchResult's step 3
+        // does. If that screen never shows up within this short window, that's not
+        // treated as a failure -- the hold conversion may already be done, or may
+        // be happening in place without a URL change, and either way the holds-list
+        // re-scrape below is what actually decides the outcome.
+        val onRequestCheckScript =
+            "(() => JSON.stringify({ onRequest: location.href.includes('/request') }))();"
+        var onRequestScreen = false
+        for (attempt in 0 until 6) {
+            delay(400)
+            val onRequest = evaluateJs(onRequestCheckScript)
+                ?.let { runCatching { JSONObject(it).optBoolean("onRequest") }.getOrNull() } ?: false
+            if (onRequest) {
+                onRequestScreen = true
+                break
+            }
+        }
+        if (onRequestScreen) {
+            val confirmClickScript = """
+                (() => {
+                    const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+                    const btn = document.querySelector('.circ-confirm-button') ||
+                        Array.from(document.querySelectorAll('button')).find((el) => {
+                            const text = clean(el.textContent).toLowerCase();
+                            return text === 'borrow' || text === 'place hold' || text === 'place a hold';
+                        });
+                    if (!btn) return JSON.stringify({ found: false, actionText: '' });
+                    const clickedText = clean(btn.textContent);
+                    btn.click();
+                    return JSON.stringify({ found: true, actionText: clickedText });
+                })();
+            """.trimIndent()
+            for (attempt in 0 until 10) {
+                delay(300)
+                val json = evaluateJs(confirmClickScript)?.let { runCatching { JSONObject(it) }.getOrNull() }
+                if (json?.optBoolean("found") == true) {
+                    actionText = json.optString("actionText").ifBlank { actionText }
+                    break
+                }
+            }
+        }
+
+        // Step 3: judge success the same proven way cancelHold/suspendHold do --
+        // re-load and re-scrape /shelf/holds and check whether this hold is gone. A
+        // short settle delay first gives Libby's own in-place/AJAX confirmation
+        // (if that's what just happened) time to actually finish before this
+        // reloads the page out from under it.
+        delay(1200)
+        loadHoldsPage()
+        delay(800)
+        scrollToBottom()
+        delay(400)
+
+        val stillPresent = kotlin.coroutines.suspendCoroutine<Boolean> { continuation ->
+            scrapeHolds { holds ->
+                continuation.resume(holds.any { it.cardId == cardId && it.titleId == titleId })
+            }
+        }
+        return if (!stillPresent) {
+            true to actionText
+        } else {
+            false to "Still shows on the Holds shelf after borrowing"
         }
     }
 

@@ -14,6 +14,7 @@ data class LivrospeakSettings(
     val showLibbyBooks: Boolean = true,
     val showLocalBooks: Boolean = true,
     val showRssBooks: Boolean = true,
+    val showLibrivoxBooks: Boolean = true,
     // Off by default: this gates BOTH whether ListeningSessionStore records anything
     // and whether the Listening Stats entry point shows up on the shelf -- a user who
     // never turns it on should see zero behavior change and zero new data collected.
@@ -54,6 +55,7 @@ object LivrospeakSettingsStore {
     fun setShowLibbyBooks(enabled: Boolean) = update { it.copy(showLibbyBooks = enabled) }
     fun setShowLocalBooks(enabled: Boolean) = update { it.copy(showLocalBooks = enabled) }
     fun setShowRssBooks(enabled: Boolean) = update { it.copy(showRssBooks = enabled) }
+    fun setShowLibrivoxBooks(enabled: Boolean) = update { it.copy(showLibrivoxBooks = enabled) }
     fun setListeningStatsEnabled(enabled: Boolean) = update { it.copy(listeningStatsEnabled = enabled) }
     fun setListeningStatsColorful(enabled: Boolean) = update { it.copy(listeningStatsColorful = enabled) }
     fun setListeningStreakEnabled(enabled: Boolean) = update { it.copy(listeningStreakEnabled = enabled) }
@@ -77,6 +79,7 @@ object LivrospeakSettingsStore {
                 showLibbyBooks = json.optBoolean("showLibbyBooks", true),
                 showLocalBooks = json.optBoolean("showLocalBooks", true),
                 showRssBooks = json.optBoolean("showRssBooks", true),
+                showLibrivoxBooks = json.optBoolean("showLibrivoxBooks", true),
                 listeningStatsEnabled = json.optBoolean("listeningStatsEnabled", false),
                 listeningStatsColorful = json.optBoolean("listeningStatsColorful", false),
                 listeningStreakEnabled = json.optBoolean("listeningStreakEnabled", false),
@@ -92,6 +95,7 @@ object LivrospeakSettingsStore {
             .put("showLibbyBooks", settings.showLibbyBooks)
             .put("showLocalBooks", settings.showLocalBooks)
             .put("showRssBooks", settings.showRssBooks)
+            .put("showLibrivoxBooks", settings.showLibrivoxBooks)
             .put("listeningStatsEnabled", settings.listeningStatsEnabled)
             .put("listeningStatsColorful", settings.listeningStatsColorful)
             .put("listeningStreakEnabled", settings.listeningStreakEnabled)

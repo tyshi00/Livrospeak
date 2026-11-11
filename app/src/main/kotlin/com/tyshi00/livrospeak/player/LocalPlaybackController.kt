@@ -42,6 +42,10 @@ object LocalPlaybackController {
     private var activeBook: Audiobook? = null
     private var speed = 1f
     private var lastSavedAt = 0L
+    // Additive hook for LibrivoxPlaybackCoordinator to chain chapter files one
+    // after another -- every other caller (Local, Rss) leaves this null, which is
+    // a complete no-op, so existing single-file playback is unaffected.
+    private var onCompletedCallback: (() -> Unit)? = null
 
     val state: StateFlow<PlayerState> = mutableState.asStateFlow()
 
@@ -49,10 +53,14 @@ object LocalPlaybackController {
         appContext = context.applicationContext
     }
 
-    fun open(book: Audiobook, autoPlay: Boolean = false) {
+    /** The book whose file is currently loaded in this player, playing or paused. */
+    fun currentBook(): Audiobook? = activeBook
+
+    fun open(book: Audiobook, autoPlay: Boolean = false, onCompleted: (() -> Unit)? = null) {
         persistProgress()
         releasePlayer()
         activeBook = book
+        onCompletedCallback = onCompleted
         val saved = AudiobookProgressStore.read(book.source, book.id)
         speed = saved.playbackSpeed.coerceIn(1f, 2f)
         mutableState.value = PlayerState(
@@ -116,6 +124,7 @@ object LocalPlaybackController {
                 setOnCompletionListener { completed ->
                     updateState(completed)
                     persistProgress()
+                    onCompletedCallback?.invoke()
                 }
                 setOnErrorListener { _, what, _ ->
                     Log.w(TAG, "playback failed reason=$what")
@@ -277,5 +286,6 @@ object LocalPlaybackController {
         handler.removeCallbacks(updateRunnable)
         player?.runCatching { release() }
         player = null
+        onCompletedCallback = null
     }
 }

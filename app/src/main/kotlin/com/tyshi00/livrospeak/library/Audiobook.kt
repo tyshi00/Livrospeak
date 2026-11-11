@@ -4,6 +4,7 @@ enum class AudiobookSource {
     Libby,
     Local,
     Rss,
+    Librivox,
 }
 
 data class Audiobook(

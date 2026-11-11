@@ -28,7 +28,7 @@ import com.tyshi00.livrospeak.ui.gridUnitsAsDp
 import com.tyshi00.livrospeak.ui.lightClickable
 
 /** Which hold action is currently in flight on [ManageHoldScreen]. */
-internal enum class HoldAction { Cancel, Suspend }
+internal enum class HoldAction { Cancel, Suspend, Borrow }
 
 /**
  * Lists the account's current Libby holds. Reached from [LibbyToolsScreen]. Follows
@@ -135,9 +135,11 @@ private fun HoldRow(hold: HoldItem, onClick: () -> Unit) {
 /**
  * Manage a single hold -- mirrors ManageLoanScreen's shell exactly (title + status
  * heading + bottom bar). No dismiss button here: the Back arrow already on
- * LightTopBar covers that, so the bottom bar only needs the two real actions,
- * Cancel and Suspend (same reasoning used to drop ManageLoanScreen's redundant
- * CANCEL text button).
+ * LightTopBar covers that. The bottom bar always offers Cancel and Suspend (same
+ * reasoning used to drop ManageLoanScreen's redundant CANCEL text button), and adds
+ * a third Borrow action once the hold is actually ready for checkout -- a waiting
+ * hold has nothing to borrow yet, so that button only appears when [HoldItem.isReady]
+ * is true.
  */
 @Composable
 internal fun ManageHoldScreen(
@@ -147,6 +149,7 @@ internal fun ManageHoldScreen(
     onBack: () -> Unit,
     onCancelHold: () -> Unit,
     onSuspendHold: () -> Unit,
+    onBorrowHold: () -> Unit,
 ) {
     val busy = busyAction != null
     LivrospeakSurface {
@@ -183,6 +186,7 @@ internal fun ManageHoldScreen(
                     text = when (busyAction) {
                         HoldAction.Cancel -> "Cancelling this hold…"
                         HoldAction.Suspend -> "Suspending this hold…"
+                        HoldAction.Borrow -> "Borrowing this title…"
                         null -> "Manage this hold"
                     },
                     variant = LightTextVariant.Heading,
@@ -201,10 +205,43 @@ internal fun ManageHoldScreen(
                 }
             }
             LightBottomBar(
-                items = listOf(
-                    LightBarButton.Text("CANCEL", onClick = onCancelHold.takeIf { !busy } ?: {}),
-                    LightBarButton.Text("SUSPEND", onClick = onSuspendHold.takeIf { !busy } ?: {}),
-                ),
+                // Three equal-width text buttons didn't fit a real device's screen --
+                // BORROW/SUSPEND (wide glyphs: double O + W, wide U/S) truncated to
+                // "BORR…"/"SUSPE…" while only the narrower CANCEL rendered in full.
+                // Switched to the same icon-text-icon arrangement ManageLoanScreen's
+                // own 3-item bar already uses (Renew icon / TAG text / Return icon) --
+                // LightBottomBar spaces that evenly on its own (isMixedIconTextIconLayout)
+                // instead of forcing 3 fixed-width slots, which is exactly the class of
+                // bug this sidesteps rather than fights. BORROW keeps the clear text
+                // treatment since it's the one new, primary action this screen exists
+                // for; PAUSE/CLOSE stand in for the two already-established, well
+                // understood actions (no dedicated suspend/cancel icon exists in this
+                // app's trimmed icon set, but pause-for-suspend and close-for-cancel
+                // are both common enough pairings to read clearly without a label).
+                items = if (hold.isReady) {
+                    listOf(
+                        LightBarButton.LightIcon(
+                            icon = LightIcons.PAUSE,
+                            onClick = onSuspendHold.takeIf { !busy } ?: {},
+                            contentDescription = "Suspend Hold",
+                            // PAUSE's glyph reads visually larger than CLOSE's at the
+                            // shared default size (2f) -- sized down to match CLOSE's
+                            // apparent size rather than its literal icon-box size.
+                            sizeUnits = 1.5f,
+                        ),
+                        LightBarButton.Text("BORROW", onClick = onBorrowHold.takeIf { !busy } ?: {}),
+                        LightBarButton.LightIcon(
+                            icon = LightIcons.CLOSE,
+                            onClick = onCancelHold.takeIf { !busy } ?: {},
+                            contentDescription = "Cancel Hold",
+                        ),
+                    )
+                } else {
+                    listOf(
+                        LightBarButton.Text("CANCEL", onClick = onCancelHold.takeIf { !busy } ?: {}),
+                        LightBarButton.Text("SUSPEND", onClick = onSuspendHold.takeIf { !busy } ?: {}),
+                    )
+                },
             )
         }
     }

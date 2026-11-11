@@ -75,6 +75,9 @@ import com.tyshi00.livrospeak.library.RssDownloadManager
 import com.tyshi00.livrospeak.library.RssDownloadStatus
 import com.tyshi00.livrospeak.library.RssFeedRepository
 import com.tyshi00.livrospeak.library.RssFeedResult
+import com.tyshi00.livrospeak.library.LibrivoxDownloadManager
+import com.tyshi00.livrospeak.library.LibrivoxDownloadStatus
+import com.tyshi00.livrospeak.library.LibrivoxPlaybackCoordinator
 import com.tyshi00.livrospeak.libby.LibbyConnectCoordinator
 import com.tyshi00.livrospeak.libby.LibbyConnectState
 import com.tyshi00.livrospeak.libby.LibbySessionState
@@ -139,6 +142,14 @@ private enum class LibbyLibraryReadiness {
  */
 private const val RSS_FEED_FEATURE_ENABLED = false
 
+/**
+ * LibriVox is new and not yet verified on a real device -- same escape hatch as
+ * [RSS_FEED_FEATURE_ENABLED]: flip this to false to make it unreachable again
+ * (Settings row disappears, the when-branch below is simply never hit) without
+ * reverting any of the LibriVox code itself.
+ */
+private const val LIBRIVOX_FEATURE_ENABLED = true
+
 @Composable
 fun PlayerDebugScreen() {
     val persistedActiveAtStartup = remember { AudiobookProgressStore.lastActiveAudiobook() }
@@ -182,6 +193,22 @@ fun PlayerDebugScreen() {
     var showLibbySearch by remember { mutableStateOf(false) }
     var showListeningStats by remember { mutableStateOf(false) }
     var showLibbyTools by remember { mutableStateOf(false) }
+    var showLibrivox by remember { mutableStateOf(false) }
+    // The Books search icon opens a small chooser (Libby / LibriVox); each row
+    // opens that source's own search screen on top of it, so Back from either
+    // search returns here. librivoxEntersOnSearchInput tells LibrivoxScreen which
+    // of its two entry points it was opened from: true from this chooser (land
+    // on the search input), false from Settings -> LibriVox (land on the
+    // downloaded-books view).
+    var showSearchChooser by remember { mutableStateOf(false) }
+    // The LibriVox player's own menu (list icon on its bottom bar) and the two
+    // screens it leads to. All three sit on top of the Player screen.
+    var showLibrivoxMenu by remember { mutableStateOf(false) }
+    var showLibrivoxChapters by remember { mutableStateOf(false) }
+    var showLibrivoxRemoveConfirm by remember { mutableStateOf(false) }
+    var librivoxRemoveBusy by remember { mutableStateOf(false) }
+    var librivoxRemoveMessage by remember { mutableStateOf("") }
+    var librivoxEntersOnSearchInput by remember { mutableStateOf(false) }
     // Shared placeholder for any future Libby Tools row that isn't built yet --
     // Holds, Tags, and now Library Cards all have real screens, so nothing uses
     // this today, but it's kept rather than removed in case a future row needs it.
@@ -410,6 +437,7 @@ fun PlayerDebugScreen() {
     val rssReady by RssFeedRepository.ready.collectAsState()
     val rssRefreshingIds by RssFeedRepository.refreshingIds.collectAsState()
     val rssDownloadStates by RssDownloadManager.states.collectAsState()
+    val librivoxDownloadStates by LibrivoxDownloadManager.states.collectAsState()
     var progressRevision by remember { mutableStateOf(0) }
     var activeLoan by remember { mutableStateOf<LoanItem?>(null) }
     var activeBook by remember {
@@ -503,10 +531,61 @@ fun PlayerDebugScreen() {
             book
         }
     }
+    // One row per downloaded LibriVox BOOK (not one per chapter file) -- the actual
+    // chapter-to-chapter sequencing stays entirely inside LibrivoxPlaybackCoordinator,
+    // the same as tapping a book from LibrivoxScreen's own downloaded-books list
+    // already does via openLibrivoxBook(). durationMilliseconds/positionMilliseconds
+    // are deliberately left at their defaults (0) here: this app has no notion of a
+    // LibriVox book's whole-book duration/elapsed position across chapter files, only
+    // per-chapter progress (tracked separately, keyed by "$bookId:$chapterIndex", for
+    // resuming the right spot within whichever chapter you're on) -- claiming a
+    // specific percentage here without that data would just be a guess. The live
+    // overlay below fills in real numbers for whichever book is actually playing right
+    // now, the same way displayedLocalBooks/displayedRssBooks already do.
+    val librivoxBooks = remember(librivoxDownloadStates, progressRevision) {
+        librivoxDownloadStates.values
+            .filter { it.status == LibrivoxDownloadStatus.Downloaded }
+            .map { downloadState ->
+                val progress = AudiobookProgressStore.read(AudiobookSource.Librivox, downloadState.bookId)
+                Audiobook(
+                    id = downloadState.bookId,
+                    source = AudiobookSource.Librivox,
+                    title = downloadState.title,
+                    author = downloadState.author,
+                    playbackReference = downloadState.bookId,
+                    lastPlayedAtMilliseconds = progress.lastPlayedAtMilliseconds,
+                    lastUpdatedAtMilliseconds = progress.lastUpdatedAtMilliseconds,
+                    fileSizeBytes = downloadState.totalBytes,
+                )
+            }
+    }
+    val displayedLibrivoxBooks = librivoxBooks.map { book ->
+        // Compared via the coordinator's own currentBookId(), not activeBook?.id --
+        // while a LibriVox book is actually playing, activeBook holds the CURRENT
+        // CHAPTER's own Audiobook (id "$bookId:$index", see
+        // LibrivoxPlaybackCoordinator.openChapter's onChapterChanged callback), which
+        // never equals this row's book-level id even when it IS the book playing.
+        // activeBook's source is checked too: after switching to a Libby book the
+        // LibriVox chapter is still loaded (paused) in the local player, but it is
+        // no longer the book the app is showing as active.
+        if (
+            activeBook?.source == AudiobookSource.Librivox &&
+            LibrivoxPlaybackCoordinator.currentBookId() == book.id
+        ) {
+            book.copy(
+                positionMilliseconds = (localPlayerState.positionSeconds * 1000).toLong(),
+                durationMilliseconds = (localPlayerState.durationSeconds * 1000).toLong()
+                    .takeIf { it > 0 } ?: book.durationMilliseconds,
+            )
+        } else {
+            book
+        }
+    }
     val allBooks = buildList {
         if (livrospeakSettings.showLibbyBooks) addAll(libbyBooks)
         if (livrospeakSettings.showLocalBooks) addAll(displayedLocalBooks)
         if (RSS_FEED_FEATURE_ENABLED && livrospeakSettings.showRssBooks) addAll(displayedRssBooks)
+        if (LIBRIVOX_FEATURE_ENABLED && livrospeakSettings.showLibrivoxBooks) addAll(displayedLibrivoxBooks)
     }.sortedWith(
         compareByDescending<Audiobook> { it.lastPlayedAtMilliseconds }
             .thenBy(String.CASE_INSENSITIVE_ORDER) { it.title },
@@ -612,11 +691,94 @@ fun PlayerDebugScreen() {
         }
     }
 
+    // Separate from openBook() below rather than folded into its generic dispatch:
+    // a LibriVox book is several chapter files, not one, so playing it needs
+    // LibrivoxPlaybackCoordinator's chapter-to-chapter advancing, not a single
+    // LocalPlaybackController.open() call. This still sets the same activeBook /
+    // progressRevision / showBooks state openBook() would, so the Player screen
+    // behaves the same regardless of which function opened the book.
+    //
+    // Declared BEFORE openBook() (which now calls this from its own Librivox
+    // branch) rather than after: unlike member functions, Kotlin local functions
+    // are NOT visible to a sibling local function declared earlier in the same
+    // block -- a real build confirmed this the hard way ("Unresolved reference
+    // 'openLibrivoxBook'") after this was first written below openBook() with an
+    // incorrect assumption that local functions forward-reference each other the
+    // way top-level ones do.
+    // Runs each time LibrivoxPlaybackCoordinator opens a chapter (the first one,
+    // every automatic advance, and a jump from Chapter Selection): makes that
+    // chapter the book the Player screen shows. Declared before its two callers
+    // below, for the same local-function ordering reason.
+    fun librivoxChapterOpened(chapterBook: Audiobook) {
+        val opened = AudiobookProgressStore.markOpened(chapterBook)
+        activeBook = chapterBook.copy(
+            lastPlayedAtMilliseconds = opened.lastPlayedAtMilliseconds,
+            lastUpdatedAtMilliseconds = opened.lastUpdatedAtMilliseconds,
+        )
+        progressRevision++
+    }
+
+    // autoPlay is true for an explicit "Play" (the LibriVox list's own Play
+    // action) and false when the book is opened from the Books list, where every
+    // source loads paused and waits for the player's own play button.
+    fun openLibrivoxBook(bookId: String, title: String, author: String, autoPlay: Boolean) {
+        LibbyBridge.pause()
+        showBooks = false
+        showLibrivox = false
+        showSearchChooser = false
+        // LibrivoxScreen can be open on top of Settings (Settings -> LibriVox), and
+        // Settings is checked before the Player in the screen switch below, so
+        // leaving it set kept Settings on screen instead of the player.
+        showSettings = false
+        LibrivoxPlaybackCoordinator.play(
+            bookId = bookId,
+            title = title,
+            author = author,
+            autoPlay = autoPlay,
+        ) { chapterBook -> librivoxChapterOpened(chapterBook) }
+    }
+
+    // Chapter Selection: jump to one chapter of a downloaded book and play it
+    // from its beginning. Title and author come from the download's own record
+    // rather than activeBook, whose author line is decorated with "Chapter N of M".
+    fun openLibrivoxChapter(bookId: String, index: Int) {
+        val download = LibrivoxDownloadManager.stateFor(bookId)
+        LibbyBridge.pause()
+        LibrivoxPlaybackCoordinator.playChapter(
+            bookId = bookId,
+            title = download?.title?.takeIf { it.isNotBlank() } ?: activeBook?.title.orEmpty(),
+            author = download?.author.orEmpty(),
+            index = index,
+        ) { chapterBook -> librivoxChapterOpened(chapterBook) }
+    }
+
     fun openBook(book: Audiobook, autoPlay: Boolean = false) {
         val previous = activeBook
         val requestedId = AudiobookProgressStore.qualifiedId(book.source, book.id)
         val activeId = previous?.let { AudiobookProgressStore.qualifiedId(it.source, it.id) }
-        if (requestedId == activeId) {
+        // A LibriVox row's own id is the whole BOOK's id, but activeBook while one is
+        // actually playing holds the CURRENT CHAPTER's own Audiobook instead (id
+        // "$bookId:$index", set by LibrivoxPlaybackCoordinator.openChapter's
+        // onChapterChanged callback below) -- comparing qualifiedId directly would
+        // never match even when re-tapping the exact book that's already playing, and
+        // falling through to the full open flow below would restart that chapter's
+        // MediaPlayer from scratch for no reason. Asking the coordinator directly (the
+        // same accessor LibrivoxDownloadManager.removeDownload uses) is what actually
+        // answers "is this book the one playing right now".
+        //
+        // The coordinator alone is not enough, though. Opening a Libby book only
+        // pauses the local player, so the LibriVox chapter stays loaded there and
+        // the coordinator still reports its book. Without also requiring that the
+        // book the app is showing (previous) is a LibriVox one, tapping that
+        // LibriVox book after listening to a Libby loan was treated as "already
+        // open" and returned to the Player screen with the Libby loan still on it.
+        val alreadyActive = if (book.source == AudiobookSource.Librivox) {
+            previous?.source == AudiobookSource.Librivox &&
+                LibrivoxPlaybackCoordinator.currentBookId() == book.id
+        } else {
+            requestedId == activeId
+        }
+        if (alreadyActive) {
             AudiobookProgressStore.markOpened(book)
             progressRevision++
             showBooks = false
@@ -666,9 +828,25 @@ fun PlayerDebugScreen() {
                 Log.d("ListeningStats", "Reopening ${book.title}: local player was in Error state")
                 LocalPlaybackController.open(book, autoPlay = false)
             }
+            // Same retry, for the same reason, for a LibriVox chapter -- but book here
+            // is the book-level row (playbackReference is just the bookId, not a real
+            // file), so the actual chapter file can only be resolved by going back
+            // through openLibrivoxBook/LibrivoxPlaybackCoordinator, not a direct
+            // LocalPlaybackController.open(book, ...) call the way Local/Rss retry above.
+            if (book.source == AudiobookSource.Librivox && localPlayerState.readiness == PlayerReadiness.Error) {
+                Log.d("ListeningStats", "Reopening ${book.title}: local player was in Error state")
+                openLibrivoxBook(book.id, book.title, book.author, autoPlay = false)
+            }
             return
         }
-        if (previous?.source == AudiobookSource.Local || previous?.source == AudiobookSource.Rss) {
+        if (
+            previous?.source == AudiobookSource.Local ||
+            previous?.source == AudiobookSource.Rss ||
+            previous?.source == AudiobookSource.Librivox
+        ) {
+            // LibriVox chapters play through this same LocalPlaybackController, so
+            // persistProgress() here covers them too -- it already null-guards
+            // against nothing being open, same as for Local/Rss.
             LocalPlaybackController.persistProgress()
             if (previous.source == AudiobookSource.Local) {
                 LocalBookRepository.updateBook(
@@ -696,6 +874,14 @@ fun PlayerDebugScreen() {
                 if (book.source == AudiobookSource.Local) LocalBookRepository.updateBook(openedBook)
                 LocalPlaybackController.open(openedBook, autoPlay = autoPlay)
             }
+            // Now the real, expected path for a LibriVox row tapped from the unified
+            // Books list (book.id is the whole book's id there, not a chapter file) --
+            // openLibrivoxBook already does everything needed, including pausing Libby,
+            // and hands off to LibrivoxPlaybackCoordinator.play() for chapter-to-chapter
+            // advancing. Reused rather than duplicated so there's exactly one place
+            // that opens a LibriVox book, same as the search screen's own Play button
+            // already goes through.
+            AudiobookSource.Librivox -> openLibrivoxBook(book.id, book.title, book.author, autoPlay = autoPlay)
             AudiobookSource.Libby -> {
                 LocalPlaybackController.pause()
                 pauseLibbyWhenReady = true
@@ -858,6 +1044,10 @@ fun PlayerDebugScreen() {
             update = { webView -> webView.clearFocus() },
         )
 
+        // The active book, only when it is a LibriVox chapter: what the LibriVox
+        // player menu's three screens below act on.
+        val activeLibrivoxBook = activeBook?.takeIf { it.source == AudiobookSource.Librivox }
+
         when {
             // Checked first, before every other screen's own branch below: this can
             // be opened as an overlay from either ManageLoanScreen or the Libby search
@@ -994,6 +1184,7 @@ fun PlayerDebugScreen() {
                                     RssDownloadManager.removeDownload(book)
                                     true
                                 }
+                                AudiobookSource.Librivox -> LibrivoxDownloadManager.removeDownload(book.id)
                                 AudiobookSource.Libby -> false
                             }
                             if (removed) {
@@ -1280,7 +1471,20 @@ fun PlayerDebugScreen() {
                     onShowLibbyBooksChange = LivrospeakSettingsStore::setShowLibbyBooks,
                     onShowLocalBooksChange = LivrospeakSettingsStore::setShowLocalBooks,
                     onShowRssBooksChange = LivrospeakSettingsStore::setShowRssBooks,
+                    onShowLibrivoxBooksChange = LivrospeakSettingsStore::setShowLibrivoxBooks,
                     onBack = { showAudiobookSources = false },
+                )
+            }
+
+            // Must be checked before `showSettings` and `showSearchChooser` below,
+            // same reason showAudiobookSources is: opening this from either never
+            // clears that screen's own flag, so Back from LibrivoxScreen lands on
+            // whichever one it was opened from instead of falling through to Books.
+            showLibrivox -> {
+                LibrivoxScreen(
+                    onBack = { showLibrivox = false },
+                    onPlay = { bookId, title, author -> openLibrivoxBook(bookId, title, author, autoPlay = true) },
+                    startOnSearchInput = librivoxEntersOnSearchInput,
                 )
             }
 
@@ -1300,6 +1504,12 @@ fun PlayerDebugScreen() {
                     onOpenLibby = { showLibbySource = true },
                     onOpenLocalBooks = { showLocalBooks = true },
                     onOpenRssFeeds = { showRssFeeds = true },
+                    onOpenLibrivox = {
+                        // Settings entry: land on the downloaded-books view, not the
+                        // search input the chooser entry uses.
+                        librivoxEntersOnSearchInput = false
+                        showLibrivox = true
+                    },
                     onListeningStatsEnabledChange = LivrospeakSettingsStore::setListeningStatsEnabled,
                     onListeningStatsColorfulChange = LivrospeakSettingsStore::setListeningStatsColorful,
                     onListeningStreakEnabledChange = LivrospeakSettingsStore::setListeningStreakEnabled,
@@ -1312,7 +1522,10 @@ fun PlayerDebugScreen() {
                     onBorrowed = {
                         // A fresh loan was added; drop back to Books and let the existing
                         // shelf-polling LaunchedEffect (below) pick it up on its next pass.
+                        // The chooser this search was opened from is cleared too, or it
+                        // would be what shows instead of Books.
                         showLibbySearch = false
+                        showSearchChooser = false
                         showBooks = true
                     },
                     // Not an owned loan, so NOT sent to the shelf -- a search result
@@ -1321,6 +1534,20 @@ fun PlayerDebugScreen() {
                     // here is its own resyncSearchResultPage(result), already confirmed
                     // working once by requestManageTags before this is even called.
                     onManageTags = { titleId, titleName, resync -> openManageTags(titleId, titleName, resync) },
+                )
+            }
+
+            // After showLibrivox and showLibbySearch above: each is opened from here
+            // without clearing this flag, so Back from either lands back on this
+            // chooser.
+            showSearchChooser -> {
+                SearchSourceScreen(
+                    onBack = { showSearchChooser = false },
+                    onOpenLibby = { showLibbySearch = true },
+                    onOpenLibrivox = {
+                        librivoxEntersOnSearchInput = true
+                        showLibrivox = true
+                    },
                 )
             }
 
@@ -1383,6 +1610,30 @@ fun PlayerDebugScreen() {
                                 "Could not confirm the hold was suspended."
                             }
                             if (suspended) refreshHolds()
+                        }
+                    },
+                    onBorrowHold = {
+                        manageHoldMessage = ""
+                        manageHoldBusyAction = HoldAction.Borrow
+                        scope.launch {
+                            val (borrowed, detail) = LibbyWebPlayer.borrowHold(hold.cardId, hold.titleId)
+                            manageHoldBusyAction = null
+                            if (borrowed) {
+                                // Same reasoning as LibbySearchScreen's onBorrowed: drop
+                                // back to Books and let the existing shelf-polling
+                                // LaunchedEffect pick up the new loan on its next pass,
+                                // rather than duplicating that refresh here.
+                                activeHold = null
+                                manageHoldMessage = ""
+                                showHolds = false
+                                showBooks = true
+                            } else {
+                                // Surfaces WHICH step actually failed (no button found /
+                                // never reached the confirm screen / no confirm button /
+                                // Libby never reported success) instead of a dead-end
+                                // generic message -- see borrowHold's own doc comment.
+                                manageHoldMessage = "Could not confirm the title was borrowed ($detail)."
+                            }
                         }
                     },
                 )
@@ -1526,6 +1777,75 @@ fun PlayerDebugScreen() {
                 LibraryCardScreen(onBack = { showLibraryCards = false })
             }
 
+            showLibrivoxRemoveConfirm && activeLibrivoxBook != null -> {
+                val book = activeLibrivoxBook!!
+                val bookId = LibrivoxPlaybackCoordinator.bookIdOf(book.id)
+                LibrivoxRemoveDownloadScreen(
+                    title = book.title,
+                    message = librivoxRemoveMessage,
+                    busy = librivoxRemoveBusy,
+                    onCancel = {
+                        showLibrivoxRemoveConfirm = false
+                        librivoxRemoveMessage = ""
+                    },
+                    onConfirm = {
+                        librivoxRemoveBusy = true
+                        librivoxRemoveMessage = ""
+                        // Stopped here, on the main thread, before the files go:
+                        // removeDownload would also stop it, but from its IO thread.
+                        if (LibrivoxPlaybackCoordinator.currentBookId() == bookId) {
+                            LibrivoxPlaybackCoordinator.stop()
+                        }
+                        scope.launch {
+                            val removed = LibrivoxDownloadManager.removeDownload(bookId)
+                            librivoxRemoveBusy = false
+                            if (removed) {
+                                AudiobookProgressStore.clearLastActiveIfMatches(book.source, book.id)
+                                activeBook = null
+                                showLibrivoxRemoveConfirm = false
+                                showLibrivoxChapters = false
+                                showLibrivoxMenu = false
+                                showBooks = true
+                            } else {
+                                librivoxRemoveMessage = "Could not remove the download."
+                            }
+                        }
+                    },
+                )
+            }
+
+            showLibrivoxChapters && activeLibrivoxBook != null -> {
+                val book = activeLibrivoxBook!!
+                val bookId = LibrivoxPlaybackCoordinator.bookIdOf(book.id)
+                val currentChapterIndex = LibrivoxPlaybackCoordinator.chapterIndexOf(book.id)
+                    ?: LibrivoxDownloadManager.stateFor(bookId)?.lastChapterIndex
+                LibrivoxChaptersScreen(
+                    chapterCount = remember(bookId) { LibrivoxDownloadManager.downloadedFiles(bookId).size },
+                    currentChapterIndex = currentChapterIndex,
+                    onBack = { showLibrivoxChapters = false },
+                    onSelectChapter = { index ->
+                        showLibrivoxChapters = false
+                        showLibrivoxMenu = false
+                        // The chapter already loaded just returns to the player;
+                        // jumping to it would restart it from the beginning.
+                        val alreadyLoaded = index == currentChapterIndex &&
+                            LibrivoxPlaybackCoordinator.currentBookId() == bookId
+                        if (!alreadyLoaded) openLibrivoxChapter(bookId, index)
+                    },
+                )
+            }
+
+            showLibrivoxMenu && activeLibrivoxBook != null -> {
+                LibrivoxPlayerMenuScreen(
+                    onBack = { showLibrivoxMenu = false },
+                    onOpenChapters = { showLibrivoxChapters = true },
+                    onRemoveDownload = {
+                        librivoxRemoveMessage = ""
+                        showLibrivoxRemoveConfirm = true
+                    },
+                )
+            }
+
             showLibbyTools -> {
                 LibbyToolsScreen(
                     onBack = { showLibbyTools = false },
@@ -1547,11 +1867,25 @@ fun PlayerDebugScreen() {
                     loading = booksLoading,
                     message = booksMessage,
                     hasDownloads = downloadedBooks.isNotEmpty(),
-                    libbyConnected = sessionReady,
+                    searchAvailable = sessionReady || LIBRIVOX_FEATURE_ENABLED,
                     showListeningStatsButton = livrospeakSettings.listeningStatsEnabled,
                     onListeningStats = { showListeningStats = true },
                     onSettings = { showSettings = true },
-                    onSearch = { showLibbySearch = true },
+                    onSearch = {
+                        // Always the chooser, never straight into one catalog's
+                        // search. It used to skip the chooser and open LibriVox
+                        // search whenever Libby's session wasn't reading as
+                        // connected, which left no way to reach Libby search from
+                        // here. Both search flags are cleared first so a search
+                        // screen can't be what shows instead of the chooser.
+                        showLibrivox = false
+                        showLibbySearch = false
+                        if (LIBRIVOX_FEATURE_ENABLED) {
+                            showSearchChooser = true
+                        } else {
+                            showLibbySearch = true
+                        }
+                    },
                     onDownloads = { showDownloads = true },
                     onRefresh = ::refreshAllBookSources,
                     onMenu = { showLibbyTools = true },
@@ -1614,7 +1948,11 @@ fun PlayerDebugScreen() {
                     downloadStatus = when (activeBook?.source) {
                         AudiobookSource.Local -> null
                         AudiobookSource.Rss -> rssDownloadState?.status ?: RssDownloadStatus.NotDownloaded
-                        AudiobookSource.Libby, null -> null
+                        // LibriVox's own download progress shows on the LibriVox screen
+                        // itself, which uses its own LibrivoxDownloadStatus type -- this
+                        // Player-screen indicator stays RSS-specific rather than forcing
+                        // a shared type onto a different download model.
+                        AudiobookSource.Librivox, AudiobookSource.Libby, null -> null
                     },
                     onDownload = activeBook
                         ?.takeIf { it.source == AudiobookSource.Rss && activeRssFeedId != null }
@@ -1647,6 +1985,9 @@ fun PlayerDebugScreen() {
                     onManageLoan = activeBook
                         ?.takeIf { it.source == AudiobookSource.Libby }
                         ?.let { { showManageLoan = true } },
+                    onLibrivoxMenu = activeBook
+                        ?.takeIf { it.source == AudiobookSource.Librivox }
+                        ?.let { { showLibrivoxMenu = true } },
                 )
             }
         }
@@ -1810,7 +2151,7 @@ fun PlayerDebugScreen() {
             val libbyActuallyPlaying = currentUrl.contains("/open/loan/") && state.isPlaying
             val effectiveIsPlaying = when (activeBook?.source) {
                 AudiobookSource.Libby -> libbyActuallyPlaying
-                AudiobookSource.Local, AudiobookSource.Rss -> localPlayerState.isPlaying
+                AudiobookSource.Local, AudiobookSource.Rss, AudiobookSource.Librivox -> localPlayerState.isPlaying
                 null -> false
             }
             ListeningSessionStore.onPlaybackTick(activeBook, effectiveIsPlaying)
@@ -1902,6 +2243,10 @@ fun PlayerDebugScreen() {
                 LibbySessionState.Disconnected -> true
             }
             AudiobookSource.Rss -> rssReady
+            // LibriVox books aren't resolved through this persisted-last-book path yet
+            // (not added to allBooks in this pass), so there's nothing to wait on --
+            // "finished" here just means stop showing the loading spinner for it.
+            AudiobookSource.Librivox -> true
         }
         if (resolutionFinished) {
             pendingNowPlaying = null
@@ -2051,7 +2396,7 @@ private fun BooksScreen(
     loading: Boolean,
     message: String,
     hasDownloads: Boolean,
-    libbyConnected: Boolean,
+    searchAvailable: Boolean,
     showListeningStatsButton: Boolean,
     onListeningStats: () -> Unit,
     onSettings: () -> Unit,
@@ -2111,17 +2456,16 @@ private fun BooksScreen(
                         onClick = onSettings,
                         contentDescription = "Settings",
                     ),
-                    // Search opens Libby's own catalog search (see its "Search
-                    // Libby" content description) -- it has nothing to offer
-                    // without a connected Libby account, so it's hidden the same
+                    // Search covers Libby's catalog and LibriVox's. With neither
+                    // available it has nothing to offer, so it's hidden the same
                     // way Downloads is hidden when there's nothing to show,
                     // letting the remaining icons re-center rather than leaving a
                     // dead button in the bar.
-                    if (libbyConnected) {
+                    if (searchAvailable) {
                         LightBarButton.LightIcon(
                             icon = LightIcons.SEARCH,
                             onClick = onSearch,
-                            contentDescription = "Search Libby",
+                            contentDescription = "Search",
                         )
                     } else {
                         null
@@ -2626,6 +2970,7 @@ private fun DownloadRow(
             val source = when (book.source) {
                 AudiobookSource.Local -> "Local storage"
                 AudiobookSource.Rss -> "RSS feed"
+                AudiobookSource.Librivox -> "LibriVox"
                 AudiobookSource.Libby -> ""
             }
             val size = formatDownloadSize(book.fileSizeBytes)
@@ -2837,6 +3182,10 @@ private fun BookRow(book: Audiobook, rssDownloaded: Boolean, onClick: () -> Unit
             AudiobookSource.Libby -> book.dueText
             AudiobookSource.Local -> "Local storage"
             AudiobookSource.Rss -> if (rssDownloaded) "Downloaded" else "Not downloaded"
+            // Only downloaded LibriVox books are ever added to the unified list this
+            // row renders in (see librivoxBooks above), so this is always true here --
+            // not downloaded yet means not in this list at all.
+            AudiobookSource.Librivox -> "Downloaded"
         }
         val status = listOf(progress, sourceStatus)
             .filter { it.isNotBlank() }
@@ -2848,6 +3197,41 @@ private fun BookRow(book: Audiobook, rssDownloaded: Boolean, onClick: () -> Unit
             overflow = TextOverflow.Ellipsis,
             lighten = true,
         )
+    }
+}
+
+/**
+ * Chooser opened by the Books search icon: one row per searchable catalog, each
+ * opening that catalog's own search screen. Same shell and rows as
+ * [LibbyToolsScreen] (LivrospeakSurface + LightTopBar + SettingsRow items).
+ */
+@Composable
+private fun SearchSourceScreen(
+    onBack: () -> Unit,
+    onOpenLibby: () -> Unit,
+    onOpenLibrivox: () -> Unit,
+) {
+    LivrospeakSurface {
+        Column(modifier = Modifier.fillMaxSize()) {
+            LightTopBar(
+                leftButton = LightBarButton.LightIcon(
+                    icon = LightIcons.BACK,
+                    onClick = onBack,
+                    contentDescription = "Back to Books",
+                ),
+                center = LightTopBarCenter.Text("Search"),
+            )
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .padding(start = 1.5f.gridUnitsAsDp()),
+            ) {
+                Spacer(Modifier.height(1f.gridUnitsAsDp()))
+                SettingsRow(title = "Libby", onClick = onOpenLibby)
+                SettingsRow(title = "LibriVox", onClick = onOpenLibrivox)
+            }
+        }
     }
 }
 
@@ -3060,7 +3444,7 @@ private fun LibbySearchScreen(
                 doneLabel = "SEARCH",
                 submittingLabel = "SEARCHING…",
                 keyboardKey = "LivrospeakLibbySearchKeyboard",
-                backContentDescription = "Back to Books",
+                backContentDescription = "Back",
                 underline = false,
             )
         } else {
@@ -3265,6 +3649,7 @@ private fun PlayerScreen(
     statusText: String,
     onBooks: () -> Unit,
     onManageLoan: (() -> Unit)? = null,
+    onLibrivoxMenu: (() -> Unit)? = null,
 ) {
     var showSpeedPicker by remember { mutableStateOf(false) }
     var requestedSpeed by remember { mutableStateOf<Double?>(null) }
@@ -3508,6 +3893,15 @@ private fun PlayerScreen(
                             icon = LightIcons.LIST,
                             onClick = it,
                             contentDescription = "Manage Loan",
+                        )
+                    },
+                    // Same icon and slot as Manage Loan; a book is only ever one
+                    // of the two sources, so at most one of these is present.
+                    onLibrivoxMenu?.let {
+                        LightBarButton.LightIcon(
+                            icon = LightIcons.LIST,
+                            onClick = it,
+                            contentDescription = "LibriVox Menu",
                         )
                     },
                 ),
@@ -3997,6 +4391,7 @@ private fun SettingsScreen(
     onOpenLibby: () -> Unit,
     onOpenLocalBooks: () -> Unit,
     onOpenRssFeeds: () -> Unit,
+    onOpenLibrivox: () -> Unit,
     onListeningStatsEnabledChange: (Boolean) -> Unit,
     onListeningStatsColorfulChange: (Boolean) -> Unit,
     onListeningStreakEnabledChange: (Boolean) -> Unit,
@@ -4064,6 +4459,9 @@ private fun SettingsScreen(
                 if (RSS_FEED_FEATURE_ENABLED && settings.showRssBooks) {
                     SettingsRow(title = "RSS Feeds", onClick = onOpenRssFeeds)
                 }
+                if (LIBRIVOX_FEATURE_ENABLED && settings.showLibrivoxBooks) {
+                    SettingsRow(title = "LibriVox", onClick = onOpenLibrivox)
+                }
             }
         }
     }
@@ -4075,6 +4473,7 @@ private fun AudiobookSourceSettingsScreen(
     onShowLibbyBooksChange: (Boolean) -> Unit,
     onShowLocalBooksChange: (Boolean) -> Unit,
     onShowRssBooksChange: (Boolean) -> Unit,
+    onShowLibrivoxBooksChange: (Boolean) -> Unit,
     onBack: () -> Unit,
 ) {
     LivrospeakSurface {
@@ -4110,6 +4509,13 @@ private fun AudiobookSourceSettingsScreen(
                         title = "Show RSS Books",
                         checked = settings.showRssBooks,
                         onToggle = onShowRssBooksChange,
+                    )
+                }
+                if (LIBRIVOX_FEATURE_ENABLED) {
+                    ToggleRow(
+                        title = "Show LibriVox Books",
+                        checked = settings.showLibrivoxBooks,
+                        onToggle = onShowLibrivoxBooksChange,
                     )
                 }
             }
