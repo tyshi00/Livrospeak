@@ -30,7 +30,7 @@ data class LibbySearchResult(
      *  time the user taps a result the WebView may already have moved on to a
      *  later page. */
     val page: Int = 1,
-    /** Which linked library card (see [LibbyWebPlayer.LIBBY_LIBRARIES]) this result
+    /** Which library (the [LibbyLibrary.key] of an entry in [LibbyLibraryStore]) this result
      *  came from -- search now queries every configured library and merges the
      *  results, so re-navigating to this exact result later needs both the right
      *  library AND the right page, not just the page. The SAME titleId can

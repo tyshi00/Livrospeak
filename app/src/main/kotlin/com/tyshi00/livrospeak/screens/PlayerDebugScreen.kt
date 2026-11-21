@@ -51,6 +51,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import com.tyshi00.livrospeak.LibbyBridge
 import com.tyshi00.livrospeak.PlaybackForegroundService
 import com.tyshi00.livrospeak.LibbyWebPlayer
+import com.tyshi00.livrospeak.NowPlayingSession
 import com.tyshi00.livrospeak.library.Audiobook
 import com.tyshi00.livrospeak.library.AudiobookProgressStore
 import com.tyshi00.livrospeak.library.AudiobookSource
@@ -59,6 +60,8 @@ import com.tyshi00.livrospeak.library.LivrospeakSettings
 import com.tyshi00.livrospeak.library.LivrospeakSettingsStore
 import com.tyshi00.livrospeak.library.LibbyAvailability
 import com.tyshi00.livrospeak.library.LibbySearchResult
+import com.tyshi00.livrospeak.library.LibbyLibrary
+import com.tyshi00.livrospeak.library.LibbyLibraryStore
 import com.tyshi00.livrospeak.library.LibraryCardPinStore
 import com.tyshi00.livrospeak.library.ListeningSession
 import com.tyshi00.livrospeak.library.ListeningSessionStore
@@ -150,6 +153,15 @@ private const val RSS_FEED_FEATURE_ENABLED = false
  */
 private const val LIBRIVOX_FEATURE_ENABLED = true
 
+/**
+ * How long Libby must have read as "not playing" without interruption before the
+ * idle-time genre lookup may treat a loan page as paused and navigate the shared
+ * WebView away from it. One poll reading "not playing" is not proof of a pause:
+ * the player can read that way for a moment while it moves between audio parts,
+ * and navigating away at that moment would stop a book that is still playing.
+ */
+private const val GENRE_LOOKUP_PAUSE_SETTLE_MILLISECONDS = 30_000L
+
 @Composable
 fun PlayerDebugScreen() {
     val persistedActiveAtStartup = remember { AudiobookProgressStore.lastActiveAudiobook() }
@@ -177,6 +189,11 @@ fun PlayerDebugScreen() {
     var showLibbySource by remember { mutableStateOf(false) }
     var showLibbyConnect by remember { mutableStateOf(false) }
     var showDisconnectConfirmation by remember { mutableStateOf(false) }
+    var showAddLibbyLibrary by remember { mutableStateOf(false) }
+    var pendingLibbyLibraryRemoval by remember { mutableStateOf<LibbyLibrary?>(null) }
+    var libbyLibraryMessage by remember { mutableStateOf("") }
+    val libbyLibraries by LibbyLibraryStore.libraries.collectAsState()
+    val findingLibbyLibraries by LibbyWebPlayer.detectingLibraries.collectAsState()
     var showResetLibraryCardPinConfirmation by remember { mutableStateOf(false) }
     var showLocalBooks by remember { mutableStateOf(false) }
     var showRssFeeds by remember { mutableStateOf(false) }
@@ -1342,6 +1359,9 @@ fun PlayerDebugScreen() {
                     onBack = { showDisconnectConfirmation = false },
                     onDisconnect = {
                         LibbyConnectCoordinator.disconnect()
+                        // The next account searches its own libraries, not these.
+                        LibbyLibraryStore.clear()
+                        libbyLibraryMessage = ""
                         loans = emptyList()
                         activeLoan = null
                         lastActiveLoanUrl = ""
@@ -1431,17 +1451,65 @@ fun PlayerDebugScreen() {
                 )
             }
 
+            // Both opened from the Libby settings screen below, which stays open
+            // underneath, so Back from either lands back on it.
+            showAddLibbyLibrary -> {
+                AddLibbyLibraryScreen(
+                    libbyPlaying = { currentUrl.contains("/open/loan/") && state.isPlaying },
+                    onBack = { showAddLibbyLibrary = false },
+                    onAdded = {
+                        libbyLibraryMessage = ""
+                        showAddLibbyLibrary = false
+                    },
+                )
+            }
+
+            pendingLibbyLibraryRemoval != null -> {
+                val library = pendingLibbyLibraryRemoval!!
+                RemoveLibbyLibraryScreen(
+                    library = library,
+                    onBack = { pendingLibbyLibraryRemoval = null },
+                    onConfirm = {
+                        LibbyLibraryStore.removeByHand(library.key)
+                        pendingLibbyLibraryRemoval = null
+                    },
+                )
+            }
+
             showLibbySource -> {
                 LibbySourceScreen(
                     sessionState = libbySessionState,
                     hasLibraryCardPin = LibraryCardPinStore.hasPin(),
-                    onBack = { showLibbySource = false },
+                    libraries = libbyLibraries,
+                    findingLibraries = findingLibbyLibraries,
+                    libraryMessage = libbyLibraryMessage,
+                    onBack = {
+                        libbyLibraryMessage = ""
+                        showLibbySource = false
+                    },
                     onConnect = {
                         showLibbyConnect = true
                         LibbyConnectCoordinator.startConnection()
                     },
                     onDisconnect = { showDisconnectConfirmation = true },
                     onResetLibraryCardPin = { showResetLibraryCardPinConfirmation = true },
+                    onRefreshLibraries = {
+                        // Reading the libraries moves the hidden Libby page, which
+                        // would stop a Libby book that is playing.
+                        if (currentUrl.contains("/open/loan/") && state.isPlaying) {
+                            libbyLibraryMessage = "Pause your Libby book first, then refresh."
+                        } else {
+                            libbyLibraryMessage = ""
+                            scope.launch {
+                                if (!LibbyWebPlayer.refreshLinkedLibraries()) {
+                                    libbyLibraryMessage = "Couldn't read your libraries " +
+                                        "from Libby. Try again in a moment."
+                                }
+                            }
+                        }
+                    },
+                    onAddLibrary = { showAddLibbyLibrary = true },
+                    onRemoveLibrary = { pendingLibbyLibraryRemoval = it },
                 )
             }
 
@@ -1995,6 +2063,10 @@ fun PlayerDebugScreen() {
 
     LaunchedEffect(Unit) {
         LibbyConnectCoordinator.refreshSessionState()
+        // When Libby was first seen "not playing" in the current unbroken run of
+        // such readings (elapsedRealtime), or 0 while it is playing. See
+        // GENRE_LOOKUP_PAUSE_SETTLE_MILLISECONDS.
+        var libbyNotPlayingSince = 0L
         while (true) {
             val webView = LibbyWebPlayer.requireWebView()
             currentUrl = webView.url.orEmpty()
@@ -2092,7 +2164,15 @@ fun PlayerDebugScreen() {
             // player screen -- reusing the same "is this loan page actually live"
             // reasoning as refreshLibbyShelf's own fix.
             val idleOnShelf = currentUrl.contains("/shelf")
-            val idleOnPausedLoanPage = showBooks && currentUrl.contains("/open/loan/") && !state.isPlaying
+            val tickAt = android.os.SystemClock.elapsedRealtime()
+            if (state.isPlaying) {
+                libbyNotPlayingSince = 0L
+            } else if (libbyNotPlayingSince == 0L) {
+                libbyNotPlayingSince = tickAt
+            }
+            val libbyPausedLongEnough = libbyNotPlayingSince != 0L &&
+                tickAt - libbyNotPlayingSince >= GENRE_LOOKUP_PAUSE_SETTLE_MILLISECONDS
+            val idleOnPausedLoanPage = showBooks && currentUrl.contains("/open/loan/") && libbyPausedLongEnough
             // "idleOnShelf" alone isn't enough to call the shared WebView idle:
             // Tags/Holds/Library Cards all deliberately park it on a /shelf* route
             // too (openManageTags's new ensureOnShelf path included), and this loop
@@ -2155,6 +2235,14 @@ fun PlayerDebugScreen() {
                 null -> false
             }
             ListeningSessionStore.onPlaybackTick(activeBook, effectiveIsPlaying)
+            // LightOS's playback controls (lock screen): fed the same book, the
+            // same per-source player state the player screen shows, and the same
+            // playing flag as the listening log above.
+            NowPlayingSession.update(
+                book = activeBook,
+                state = if (activeBook?.source == AudiobookSource.Libby) state else localPlayerState,
+                isPlaying = effectiveIsPlaying,
+            )
 
             delay(700)
         }
@@ -3258,40 +3346,82 @@ private fun LibbySearchScreen(
     var actionBusy by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
+    // Whether Libby's audiobooks-only search address gave results for each library
+    // in the current search (library key -> true), so later pages, and re-opening a
+    // result to borrow it, use the same address the results came from.
+    val audiobooksOnlyByLibrary = remember { mutableMapOf<String, Boolean>() }
+    // Shown in place of "Searching…" while the account's libraries are being found.
+    var searchStatus by remember { mutableStateOf("") }
+
+    // Opens one page of one library's results and waits for them to render. Libby's
+    // search results render client-side after the route loads; poll a few times the
+    // same way the shelf-hydration loop in PlayerDebugScreen() does.
+    suspend fun scrapeSearchPage(
+        library: LibbyLibrary,
+        term: String,
+        page: Int,
+        audiobooksOnly: Boolean,
+    ): List<LibbySearchResult> {
+        LibbyWebPlayer.navigateToSearch(library, term, page, audiobooksOnly)
+        var found = emptyList<LibbySearchResult>()
+        var attempts = 0
+        while (attempts < 10 && found.isEmpty()) {
+            delay(400)
+            found = suspendCancellableCoroutine { continuation ->
+                LibbyWebPlayer.scrapeSearchResults { list ->
+                    if (continuation.isActive) continuation.resume(list)
+                }
+            }
+            attempts++
+        }
+        return found
+    }
+
     suspend fun runSearch(term: String) {
         searching = true
         message = ""
         results = emptyList()
-        // Every linked library card (see LibbyWebPlayer.LIBBY_LIBRARIES) gets its
-        // own page-by-page scrape and results are merged -- see navigateToSearch's
-        // KDoc for why a title only available (or ranked differently) at one
-        // linked library would otherwise be invisible if only a different one is
-        // ever searched. This means a search now takes roughly (number of
-        // libraries) times as long as before -- worth it since the alternative is
-        // silently missing books a specific card actually has.
+        audiobooksOnlyByLibrary.clear()
+        // The libraries come from the person's own Libby account (see
+        // LibbyWebPlayer.refreshLinkedLibraries), read the first time they search
+        // and saved after that. Settings -> Libby can refresh them or add one.
+        var libraries = LibbyLibraryStore.current
+        if (libraries.isEmpty()) {
+            searchStatus = "Finding your Libby libraries…"
+            LibbyWebPlayer.refreshLinkedLibraries()
+            libraries = LibbyLibraryStore.current
+            searchStatus = ""
+        }
+        if (libraries.isEmpty()) {
+            searching = false
+            message = "Couldn't find the libraries in your Libby account. " +
+                "Open Settings, then Libby, to refresh or add one."
+            return
+        }
+        // Every library gets its own page-by-page scrape and results are merged --
+        // see navigateToSearch's KDoc for why a title only available (or ranked
+        // differently) at one library would otherwise be invisible if only a
+        // different one is ever searched. A search takes roughly (number of
+        // libraries) times as long as a single-library search.
         val collected = linkedMapOf<String, LibbySearchResult>()
-        for (library in LibbyWebPlayer.LIBBY_LIBRARIES) {
+        for (library in libraries) {
+            var audiobooksOnly = true
             var page = 1
             while (page <= MAX_LIBBY_SEARCH_PAGES) {
-                LibbyWebPlayer.navigateToSearch(library, term, page)
-                // Libby's search results render client-side after the route loads; poll
-                // a few times the same way the shelf-hydration loop in
-                // PlayerDebugScreen() does.
-                var found = emptyList<LibbySearchResult>()
-                var attempts = 0
-                while (attempts < 10 && found.isEmpty()) {
-                    delay(400)
-                    found = suspendCancellableCoroutine { continuation ->
-                        LibbyWebPlayer.scrapeSearchResults { list ->
-                            if (continuation.isActive) continuation.resume(list)
-                        }
-                    }
-                    attempts++
+                var found = scrapeSearchPage(library, term, page, audiobooksOnly)
+                if (found.isEmpty() && page == 1 && audiobooksOnly) {
+                    // The audiobooks-only address comes from one library's real
+                    // search. If it shows nothing, try the plain search address
+                    // (confirmed for any library) before deciding this library has
+                    // no matches; the scraper keeps only audiobooks either way.
+                    audiobooksOnly = false
+                    found = scrapeSearchPage(library, term, page, audiobooksOnly)
                 }
                 if (found.isEmpty()) break // no more pages of results from this library
+                audiobooksOnlyByLibrary[library.key] = audiobooksOnly
                 // Keyed by library+titleId, not just titleId: OverDrive's catalog is
                 // shared, so the exact same title can legitimately turn up under two
-                // different linked libraries with different availability at each.
+                // different libraries with different availability at each.
                 found.forEach {
                     collected["${library.id}:${it.titleId}"] = it.copy(
                         page = page,
@@ -3314,7 +3444,7 @@ private fun LibbySearchScreen(
         actionBusy = true
         message = ""
         scope.launch {
-            val library = LibbyWebPlayer.LIBBY_LIBRARIES.find { it.id == result.libraryId }
+            val library = LibbyLibraryStore.current.find { it.id == result.libraryId }
             if (library == null) {
                 actionBusy = false
                 message = "Couldn't tell which library \"${result.title}\" came from."
@@ -3328,7 +3458,12 @@ private fun LibbySearchScreen(
             // actually there before trying to click anything on it -- otherwise
             // borrowOrHoldSearchResult would be searching the wrong page's DOM for
             // this titleId and report a false "couldn't find" failure.
-            LibbyWebPlayer.navigateToSearch(library, query.trim(), result.page)
+            LibbyWebPlayer.navigateToSearch(
+                library,
+                query.trim(),
+                result.page,
+                audiobooksOnlyByLibrary[library.key] ?: true,
+            )
             var onCorrectPage = false
             for (attempt in 0 until 10) {
                 delay(400)
@@ -3382,8 +3517,13 @@ private fun LibbySearchScreen(
     // real time (reading tags, typing a name) is enough for the WebView to
     // drift again.
     suspend fun resyncSearchResultPage(result: LibbySearchResult): Boolean {
-        val library = LibbyWebPlayer.LIBBY_LIBRARIES.find { it.id == result.libraryId } ?: return false
-        LibbyWebPlayer.navigateToSearch(library, query.trim(), result.page)
+        val library = LibbyLibraryStore.current.find { it.id == result.libraryId } ?: return false
+        LibbyWebPlayer.navigateToSearch(
+            library,
+            query.trim(),
+            result.page,
+            audiobooksOnlyByLibrary[library.key] ?: true,
+        )
         for (attempt in 0 until 10) {
             delay(400)
             val stillThere = suspendCancellableCoroutine<Boolean> { continuation ->
@@ -3429,7 +3569,7 @@ private fun LibbySearchScreen(
                 value = query,
                 onValueChange = { query = it },
                 message = when {
-                    searching -> "Searching…"
+                    searching -> searchStatus.ifBlank { "Searching…" }
                     message.isNotBlank() -> message
                     else -> ""
                 },
@@ -4048,10 +4188,16 @@ private fun SpeedPicker(
 private fun LibbySourceScreen(
     sessionState: LibbySessionState,
     hasLibraryCardPin: Boolean,
+    libraries: List<LibbyLibrary>,
+    findingLibraries: Boolean,
+    libraryMessage: String,
     onBack: () -> Unit,
     onConnect: () -> Unit,
     onDisconnect: () -> Unit,
     onResetLibraryCardPin: () -> Unit,
+    onRefreshLibraries: () -> Unit,
+    onAddLibrary: () -> Unit,
+    onRemoveLibrary: (LibbyLibrary) -> Unit,
 ) {
     LivrospeakSurface {
         Column(modifier = Modifier.fillMaxSize()) {
@@ -4098,6 +4244,23 @@ private fun LibbySourceScreen(
                                 onClick = onResetLibraryCardPin,
                             )
                         }
+                        // Searches use the libraries linked to this Libby account,
+                        // read from Libby the first time someone searches (see
+                        // LibbyWebPlayer.refreshLinkedLibraries). Refresh picks up a
+                        // library card added in Libby later; Add Library covers one
+                        // that can't be read. Only libraries added here can be
+                        // removed here: the account's own come back on refresh.
+                        SettingsRow(
+                            title = if (findingLibraries) "Finding Libraries…" else "Refresh Libraries",
+                            onClick = if (findingLibraries) ({}) else onRefreshLibraries,
+                        )
+                        SettingsRow(title = "Add Library", onClick = onAddLibrary)
+                        libraries.filter { it.addedByHand }.forEach { library ->
+                            SettingsRow(
+                                title = "Remove ${library.displayName}",
+                                onClick = { onRemoveLibrary(library) },
+                            )
+                        }
                     }
                     LibbySessionState.Disconnected -> {
                         // Connecting is a two-step round trip: tapping "Connect to Libby"
@@ -4118,24 +4281,138 @@ private fun LibbySourceScreen(
                         SettingsRow(title = "Connect to Libby", onClick = onConnect)
                     }
                 }
-                Spacer(Modifier.height(1f.gridUnitsAsDp()))
-                // Every search queries each of these in turn and merges the results,
-                // so this list also doubles as an honest disclaimer: a search takes
-                // roughly this many times as long as a single-library search would,
-                // and a library card that isn't listed here isn't searched at all --
-                // adding one currently means sending a real search URL for it (the
-                // same way Cobb County and Sequoyah Regional were set up) rather
-                // than adding it from this screen. The library names below come
-                // straight from LIBBY_LIBRARIES, never hardcoded in this string --
-                // whoever builds this app sees only the library cards actually
-                // configured for their own install, not any one person's libraries.
+                if (sessionState == LibbySessionState.Connected) {
+                    Spacer(Modifier.height(1f.gridUnitsAsDp()))
+                    // Every search queries each of these in turn and merges the
+                    // results, so this list also doubles as an honest disclaimer: a
+                    // search takes roughly this many times as long as a
+                    // single-library search would.
+                    LightText(
+                        text = when {
+                            libraryMessage.isNotBlank() -> libraryMessage
+                            libraries.isEmpty() ->
+                                "Your libraries are read from your Libby account the " +
+                                    "first time you search."
+                            else -> "Searches use these libraries: " +
+                                libraries.joinToString { it.displayName } + "."
+                        },
+                        variant = LightTextVariant.Detail,
+                        lighten = true,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Settings -> Libby -> Add Library: adds a library by its Libby name, for a library
+ * the account's Menu screen didn't give up (see LibbyWebPlayer.refreshLinkedLibraries).
+ * Accepts the bare name (`nypl`) or a pasted Libby address containing it. The name is
+ * checked with Libby first (LibbyWebPlayer.lookUpLibrary), which also gives the
+ * library's real name to show in Settings and search results. Adding a library added
+ * earlier without a name looks its name up.
+ */
+@Composable
+private fun AddLibbyLibraryScreen(
+    libbyPlaying: () -> Boolean,
+    onBack: () -> Unit,
+    onAdded: () -> Unit,
+) {
+    var text by remember { mutableStateOf("") }
+    var checking by remember { mutableStateOf(false) }
+    var message by remember {
+        mutableStateOf(
+            "Type the library's Libby name: the word after libbyapp.com/library/ " +
+                "in its Libby address.",
+        )
+    }
+    val scope = rememberCoroutineScope()
+    LivrospeakSurface {
+        LightUrlInputEditor(
+            value = text,
+            onValueChange = { text = it },
+            message = if (checking) "Checking with Libby…" else message,
+            submitting = checking,
+            onBack = onBack,
+            onDone = {
+                val key = LibbyLibrary.keyFromTypedText(text)
+                val existing = key?.let { k -> LibbyLibraryStore.current.firstOrNull { it.key == k } }
+                when {
+                    key == null -> message = "That isn't a Libby library name. Use only " +
+                        "letters, numbers and dashes, like nypl."
+                    existing != null && existing.name.isNotBlank() -> onAdded()
+                    // Checking moves the hidden Libby page, which would stop a Libby
+                    // book that is playing.
+                    libbyPlaying() -> message = "Pause your Libby book first, then add a library."
+                    else -> {
+                        checking = true
+                        scope.launch {
+                            val found = LibbyWebPlayer.lookUpLibrary(key)
+                            checking = false
+                            if (found != null) {
+                                LibbyLibraryStore.addByHand(found.key, found.name)
+                                onAdded()
+                            } else {
+                                message = "Libby couldn't find a library called \"$key\". " +
+                                    "Check the name, or try again if you're offline."
+                            }
+                        }
+                    }
+                }
+            },
+            title = "Add Library",
+            doneLabel = "ADD",
+            submittingLabel = "CHECKING…",
+            keyboardKey = "LivrospeakAddLibbyLibraryKeyboard",
+            backContentDescription = "Back to Libby",
+        )
+    }
+}
+
+/** Confirms removing a library that was added by hand in Settings -> Libby. */
+@Composable
+private fun RemoveLibbyLibraryScreen(
+    library: LibbyLibrary,
+    onBack: () -> Unit,
+    onConfirm: () -> Unit,
+) {
+    LivrospeakSurface {
+        Column(modifier = Modifier.fillMaxSize()) {
+            LightTopBar(
+                leftButton = LightBarButton.LightIcon(
+                    icon = LightIcons.BACK,
+                    onClick = onBack,
+                    contentDescription = "Back to Libby",
+                ),
+            )
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .padding(horizontal = 2f.gridUnitsAsDp()),
+                verticalArrangement = Arrangement.Center,
+            ) {
                 LightText(
-                    text = "Searches are linked to these libraries: " +
-                        LibbyWebPlayer.LIBBY_LIBRARIES.joinToString { it.displayName } + ".",
-                    variant = LightTextVariant.Detail,
+                    text = library.displayName,
+                    variant = LightTextVariant.Subheading,
+                    align = TextAlign.Center,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                     lighten = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(0.5f.gridUnitsAsDp()))
+                LightText(
+                    text = "Stop searching this library?",
+                    variant = LightTextVariant.Heading,
+                    align = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth(),
                 )
             }
+            LightBottomBar(
+                items = listOf(LightBarButton.Text("REMOVE", onClick = onConfirm)),
+            )
         }
     }
 }

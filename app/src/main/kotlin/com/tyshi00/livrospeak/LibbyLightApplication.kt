@@ -4,6 +4,7 @@ import android.app.Application
 import com.tyshi00.livrospeak.library.LocalBookRepository
 import com.tyshi00.livrospeak.library.AudiobookProgressStore
 import com.tyshi00.livrospeak.library.GenreStore
+import com.tyshi00.livrospeak.library.LibbyLibraryStore
 import com.tyshi00.livrospeak.library.LibraryCardPinStore
 import com.tyshi00.livrospeak.library.ListeningSessionStore
 import com.tyshi00.livrospeak.library.LivrospeakSettingsStore
@@ -22,11 +23,13 @@ class LibbyLightApplication : Application() {
         ListeningSessionStore.init(this)
         GenreStore.init(this)
         LibraryCardPinStore.init(this)
+        LibbyLibraryStore.init(this)
         RssFeedRepository.init(this)
         RssDownloadManager.init(this)
         LibrivoxDownloadManager.init(this)
         LocalBookRepository.init(this)
         LocalPlaybackController.init(this)
+        NowPlayingSession.init(this)
 
         // Apply the persisted theme before any screen composes so LivrospeakSurface never
         // flashes dark-then-light (or vice versa) on startup.

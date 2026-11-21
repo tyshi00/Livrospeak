@@ -29,9 +29,6 @@ jobs:
         run: chmod +x gradlew
 
       - name: Build debug APK
-        env:
-          GITHUB_ACTOR: ${{ github.repository_owner }}
-          GITHUB_TOKEN: ${{ secrets.LIGHTPHONE_PACKAGES_TOKEN }}
         run: ./gradlew assembleDebug --console=plain
 
       - name: Read version from app/build.gradle.kts

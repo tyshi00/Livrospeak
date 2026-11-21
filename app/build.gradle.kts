@@ -30,8 +30,8 @@ android {
         applicationId = "com.tyshi00.livrospeak"
         minSdk = 33
         targetSdk = 34
-        versionCode = 35
-        versionName = "1.1.0"
+        versionCode = 37
+        versionName = "1.2.0"
     }
 
     signingConfigs {
@@ -91,17 +91,9 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("androidx.webkit:webkit:1.9.0")
-    // Bumped from 0.0.11 -- that version's EnBaseViewModel forwarded Space to the
-    // callback on PRESS+REPEAT; the code in LightUrlInputEditor.kt was rewritten
-    // against the library's current (0.0.19) main-branch source, which forwards it on
-    // RELEASE instead (see UrlKeyboardCallback's doc comment there for the exact
-    // contract). 0.0.19 is NOT published to this GitHub Packages registry, though --
-    // confirmed via its maven-metadata.xml that 0.0.17-dirty is the newest version
-    // actually available here, so that's what's pinned. It should carry the same
-    // post-refactor API (concrete per-locale view models, Space-on-release) that
-    // 0.0.19 does, since none of what changed between 0.0.18 and 0.0.19 touched that,
-    // but this hasn't been confirmed against 0.0.17-dirty's actual source -- if the
-    // build fails on the keyboard integration files specifically (not just dependency
-    // resolution), that mismatch is the first thing to suspect.
-    implementation("com.thelightphone.lp3keyboard:ui:0.0.17-dirty")
+    // Light's open-source LP3 keyboard (github.com/lightphone/light-keyboard), at
+    // the same version and coordinate the Light SDK uses (SDK 0.2.9). Its key
+    // handling is unchanged from 0.0.19, which LightUrlInputEditor.kt is written
+    // against.
+    implementation("com.github.lightphone:light-keyboard:v0.0.21")
 }

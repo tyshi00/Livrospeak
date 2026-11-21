@@ -144,27 +144,26 @@ fun LightUrlInputEditor(
 }
 
 /**
- * Space-bar handling here matches Light's keyboard library as of v0.0.19 (confirmed
- * against that library's own real source and its `EnQwertyViewModelTest` unit tests,
- * not guessed at): `EnBaseViewModel.onSpecialKeyPressed` fires haptics and forwards
- * every OTHER key straight through, but for `SpecialKey.Space` (and Return) its
- * `onSpecialKeyReleased` explicitly sets `consumed = false` and forwards to this
- * delegate ON RELEASE, not on press. It still fires `onSpecialKeyRepeated` on this
- * delegate roughly every 350ms while the key is held past the long-press threshold,
- * which is the only place a "repeat" insert is still needed.
+ * Space is added the moment the key goes down, then again every repeat while it is
+ * held, exactly like Light's own reference handler (`TextFieldKeyboardCallback`, which
+ * ships with the keyboard library and is what the Light SDK's text editor uses). It is
+ * not added on release or at the long-press point.
  *
- * The previous version of this file targeted lp3keyboard 0.0.11, whose ViewModel
- * apparently forwarded Space on PRESS+REPEAT instead (this callback inserted there,
- * and did nothing on release) -- that contract doesn't hold for 0.0.19's rewritten
- * EnBaseViewModel, which is why the space bar stopped working after nothing else in
- * this file changed. If a future keyboard-library bump breaks this again, re-check
- * what that version's EnBaseViewModel (or equivalent) actually calls on this
- * interface, rather than assuming this same press/release split still holds.
+ * How light-keyboard 0.0.21 reports a Space touch (`keyInput` in Lp3Keyboard.kt and
+ * `EnBaseViewModel`, read from the library's source):
+ *  - finger down: `onSpecialKeyPressed` (always, for every touch)
+ *  - lifted before the long-press timeout: `onSpecialKeyReleased`
+ *  - held past it: `onSpecialKeyLongPressed`, then `onSpecialKeyRepeated` every
+ *    350 ms, and the eventual release is swallowed
+ * Adding the space on release (as this file did before) made it depend on how long
+ * the finger stayed down and on the lift being reported; adding it on press does not.
  *
- * Haptics are no longer triggered from here at all: `EnQwertyLp3KeyboardViewModel`'s
- * `haptic` constructor parameter (wired in [keyboardFactory] below) is what
+ * Letters and Backspace are unchanged.
+ *
+ * Haptics are not triggered from here: `EnQwertyLp3KeyboardViewModel`'s `haptic`
+ * constructor parameter (wired in [keyboardFactory] below) is what
  * `EnBaseViewModel.onKeyPressed`/`onSpecialKeyPressed` call before forwarding to this
- * delegate, so calling it again here would just double the vibration per key.
+ * delegate, so calling it again here would double the vibration per key.
  */
 private class UrlKeyboardCallback(
     private val value: () -> String,
@@ -182,29 +181,22 @@ private class UrlKeyboardCallback(
     // typing feel like it dropped some keystrokes at random.
     override fun onKeyLongPressed(code: Int) = insert(code)
     override fun onKeyRepeated(code: Int) = insert(code)
-    override fun onSpecialKeyPressed(key: SpecialKey) = Unit
-    // Same swallowed-release gap as onKeyLongPressed above, but for Space/Backspace --
-    // this was the actual cause of "have to tap a few times to get a space" once Space
-    // moved to inserting on release instead of on press. EnBaseViewModel starts its
-    // repeat-while-held loop 350ms after this fires and unconditionally swallows the
-    // eventual onSpecialKeyReleased for this key (see its onSpecialKeyReleased:
-    // heldSpecialKeys.remove(key)?.apply { cancel(); return }), so a tap landing
-    // between the long-press threshold (~500ms) and that first repeat tick (~850ms)
-    // would otherwise insert nothing on press, nothing on release, and nothing from a
-    // repeat tick that never got to fire.
-    override fun onSpecialKeyLongPressed(key: SpecialKey) = performSpecialKeyAction(key)
-    override fun onSpecialKeyRepeated(key: SpecialKey) {
+    override fun onSpecialKeyPressed(key: SpecialKey) {
         if (key == SpecialKey.Space) update(value() + " ")
     }
+    // Backspace only: Space was already added when the key went down. Backspace
+    // deletes on release, or once at the long-press point (EnBaseViewModel swallows
+    // the release after a long press).
+    override fun onSpecialKeyLongPressed(key: SpecialKey) = performSpecialKeyAction(key)
+    override fun onSpecialKeyRepeated(specialKey: SpecialKey) {
+        if (specialKey == SpecialKey.Space) update(value() + " ")
+    }
     override fun onSpecialKeyReleased(key: SpecialKey) = performSpecialKeyAction(key)
-    // lp3keyboard 0.0.19's Lp3KeyboardCallback declares onSubmitWord with no default
-    // body (unlike 0.0.11, which apparently did) -- swipe typing is off for every
-    // Livrospeak keyboard (swipeEnabled = false, swipeCallback = null above), so this
-    // should never actually fire, but the interface still requires an implementation.
+    // Swipe typing is off for every Livrospeak keyboard (swipeEnabled = false, no
+    // swipe callback), so this never fires, but the interface requires it.
     override fun onSubmitWord(word: CharSequence) = Unit
     private fun performSpecialKeyAction(key: SpecialKey) {
         when (key) {
-            SpecialKey.Space -> update(value() + " ")
             SpecialKey.Backspace -> update(value().dropLast(1))
             else -> Unit
         }

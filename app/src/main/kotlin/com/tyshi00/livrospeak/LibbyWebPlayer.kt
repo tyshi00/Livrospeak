@@ -20,17 +20,20 @@ import org.json.JSONArray
 import org.json.JSONObject
 import com.tyshi00.livrospeak.library.HoldItem
 import com.tyshi00.livrospeak.library.LibbyAvailability
+import com.tyshi00.livrospeak.library.LibbyLibrary
+import com.tyshi00.livrospeak.library.LibbyLibraryStore
 import com.tyshi00.livrospeak.library.LibbySearchResult
 import com.tyshi00.livrospeak.library.LibbyTag
 import com.tyshi00.livrospeak.library.LibraryCard
 import com.tyshi00.livrospeak.library.LoanItem
 import com.tyshi00.livrospeak.library.TaggedTitle
-import java.net.URLEncoder
 import kotlin.coroutines.resume
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 private const val TAG = "LibbyWebPlayer"
 private const val LIBBY_ROOT = "https://libbyapp.com/"
@@ -65,70 +68,6 @@ private const val LIBBY_MENU = "https://libbyapp.com/interview/menu#main-menu"
  * session and playback remain persistent without exposing Libby's interface.
  */
 object LibbyWebPlayer {
-
-    /**
-     * One Libby-linked library card on this account, and how to build a search URL
-     * for it. Libby's search-route shape is NOT uniform across every library:
-     *
-     * - Cobb County's confirmed real URL: `.../search/cobbcounty/search/audiobooks/
-     *   query-.../page-1/12073324` -- slug, an "audiobooks" format segment, AND a
-     *   trailing numeric website id.
-     * - Sequoyah Regional's confirmed real URL: `.../search/sequoyah/search/
-     *   query-.../page-1` -- just the slug, no format segment, no website id at all.
-     *
-     * So rather than assume one template fits every library (which was the
-     * original, Cobb-only bug: a card with a differently-shaped route would either
-     * 404 or silently mis-resolve), each entry here carries its OWN known-working
-     * shape. [includeAudiobooksSegment] and [websiteId] both default to "leave it
-     * out", matching Sequoyah's simpler/more common shape -- the "audiobooks"
-     * segment isn't actually required for correctness even when present, since
-     * [scrapeSearchResults] already filters tiles by their own `format_audiobook`
-     * class regardless of what the URL asked for; it's Cobb's config that opts
-     * into the extra segments because that's the shape its own captured URL
-     * needed.
-     *
-     * To add another linked card later: search that library in the real Libby app
-     * or website, copy the resulting URL (same way these two were captured), and
-     * add an entry to [LIBBY_LIBRARIES] matching its shape.
-     */
-    data class LibbyLibrary(
-        val id: String,
-        val displayName: String,
-        val slug: String,
-        val websiteId: String? = null,
-        val includeAudiobooksSegment: Boolean = false,
-    ) {
-        fun searchUrl(query: String, page: Int): String {
-            val encoded = URLEncoder.encode(query, "UTF-8").replace("+", "%20")
-            val formatSegment = if (includeAudiobooksSegment) "audiobooks/" else ""
-            val base = "https://libbyapp.com/search/$slug/search/$formatSegment" +
-                "query-$encoded/page-$page"
-            return if (websiteId != null) "$base/$websiteId" else base
-        }
-    }
-
-    /**
-     * Every library card Livrospeak currently knows how to search. Searching
-     * queries ALL of these for every search (each roughly doubles -- triples,
-     * etc. -- how long a search takes, since each is its own page-by-page
-     * scrape), so this list is meant to stay short: it's not a general "add your
-     * own library" feature, just the known cards for this account. See the Libby
-     * screen in Settings for the same list shown to the user.
-     */
-    val LIBBY_LIBRARIES = listOf(
-        LibbyLibrary(
-            id = "cobbcounty",
-            displayName = "Cobb County Public Library",
-            slug = "cobbcounty",
-            websiteId = "12073324",
-            includeAudiobooksSegment = true,
-        ),
-        LibbyLibrary(
-            id = "sequoyah",
-            displayName = "Sequoyah Regional Library",
-            slug = "sequoyah",
-        ),
-    )
 
     private var webView: WebView? = null
     private var applicationContext: Context? = null
@@ -1941,6 +1880,220 @@ object LibbyWebPlayer {
         return cards
     }
 
+    // --- Linked libraries ---------------------------------------------------------
+    //
+    // Which libraries Livrospeak searches comes from the signed-in Libby account
+    // itself, so anyone, in any state, searches their own libraries. Confirmed on a
+    // real device (DevTools capture of the account Menu screen):
+    //  - each library linked to the account is an `li.summary-list-library[data-item-
+    //    id]` row, with its name in `strong.summary-list-library-name` and a
+    //    `button.summary-list-library-target`; the library Libby has selected carries
+    //    aria-current="true" on that button
+    //  - the rows hold no link and no library name in Libby's address form, but
+    //    tapping a row's target button goes to `/library/{key}` (Cobb County went to
+    //    `library/cobbcounty`), and that key is all a search address needs
+    // So each row is tapped in turn from a freshly loaded Menu screen, and the key is
+    // read from the address. Only library names are kept (LibbyLibraryStore); nothing
+    // about a library is logged beyond counts.
+
+    private data class MenuLibraryRow(val id: String, val name: String, val selected: Boolean)
+
+    private val libraryDetectionLock = Mutex()
+    private val mutableDetectingLibraries = MutableStateFlow(false)
+
+    /** True while [refreshLinkedLibraries] or [lookUpLibrary] is using the hidden page. */
+    val detectingLibraries: StateFlow<Boolean> = mutableDetectingLibraries.asStateFlow()
+
+    /**
+     * Reads the libraries linked to the signed-in Libby account and saves them to
+     * [LibbyLibraryStore]. Returns true if at least one library was read. If none
+     * could be read, the saved list is left as it was. If only some could be read,
+     * libraries found earlier are kept alongside them, so one slow page doesn't drop a
+     * library from searches.
+     *
+     * This drives the hidden Libby page, so it runs one at a time, and the page is
+     * sent back to the shelf afterwards.
+     */
+    suspend fun refreshLinkedLibraries(): Boolean = libraryDetectionLock.withLock {
+        mutableDetectingLibraries.value = true
+        try {
+            val (found, rowCount) = detectLinkedLibraries()
+            if (found.isEmpty()) return@withLock false
+            val complete = found.size == rowCount
+            val previouslyFound = LibbyLibraryStore.current.filterNot { it.addedByHand }
+            val kept = if (complete) {
+                emptyList()
+            } else {
+                previouslyFound.filter { previous -> found.none { it.key == previous.key } }
+            }
+            LibbyLibraryStore.replaceFound(found + kept)
+            true
+        } finally {
+            mutableDetectingLibraries.value = false
+            loadLibraryPage()
+        }
+    }
+
+    /**
+     * Looks a library up by its Libby name ([key], as in `libbyapp.com/library/{key}`)
+     * and returns it with the name Libby shows for it, or null if Libby can't find it
+     * within about 12 seconds. Used by Settings -> Libby -> Add Library.
+     *
+     * Confirmed on a real device (DevTools captures of `library/nypl` and of a made-up
+     * name):
+     *  - a real library: the address ends up as `/library/{key}`, and the library
+     *    screen's title (`.app-topper-title` inside `.library-surface`) changes from
+     *    "Loading Library…" to the library's name ("New York Public Library"), which
+     *    also follows "Welcome to " in `.screen-library-home-head`
+     *  - a name Libby doesn't know: the address stays on
+     *    `/interview/locate-library/resolve` and `.interview-episode-library-unresolved`
+     *    appears ("I'm having trouble fetching details about this library."). Libby
+     *    shows the same thing when it is offline.
+     * Requiring the address to name [key] means a library Libby redirected to instead
+     * is never taken for it. Takes turns with [refreshLinkedLibraries], and sends the
+     * hidden page back to the shelf afterwards.
+     */
+    suspend fun lookUpLibrary(key: String): LibbyLibrary? = libraryDetectionLock.withLock {
+        mutableDetectingLibraries.value = true
+        try {
+            requireWebView().loadUrl(LibbyLibrary(key).libraryPageUrl())
+            val script = """
+                (() => {
+                    const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+                    const titleIn = (root) => {
+                        const node = root ? root.querySelector('.app-topper-title') : null;
+                        return clean(node ? node.textContent : '');
+                    };
+                    const surfaceTitle = titleIn(document.querySelector('.library-surface'));
+                    const anyTitle = Array.from(document.querySelectorAll('.app-topper-title'))
+                        .map((node) => clean(node.textContent))
+                        .find((text) => text && !/^loading/i.test(text)) || '';
+                    const head = document.querySelector('.screen-library-home-head');
+                    const welcome = clean(head ? head.textContent : '').replace(/^welcome to\s+/i, '');
+                    return JSON.stringify({
+                        path: location.pathname,
+                        unresolved: !!document.querySelector('.interview-episode-library-unresolved'),
+                        name: [surfaceTitle, anyTitle, welcome]
+                            .find((text) => text && !/^loading/i.test(text)) || '',
+                    });
+                })();
+            """.trimIndent()
+            repeat(30) {
+                delay(400)
+                val page = evaluateJs(script)?.let { runCatching { JSONObject(it) }.getOrNull() }
+                    ?: return@repeat
+                if (page.optBoolean("unresolved")) {
+                    Log.d(TAG, "lookUpLibrary: Libby could not resolve the library")
+                    return@withLock null
+                }
+                val name = page.optString("name").take(120)
+                if (LibbyLibrary.keyFromLibraryPath(page.optString("path")) == key && name.isNotBlank()) {
+                    return@withLock LibbyLibrary(key = key, name = name, addedByHand = true)
+                }
+            }
+            Log.d(TAG, "lookUpLibrary: timed out")
+            null
+        } finally {
+            mutableDetectingLibraries.value = false
+            loadLibraryPage()
+        }
+    }
+
+    /** The libraries read, in the Menu screen's order, and how many rows it showed. */
+    private suspend fun detectLinkedLibraries(): Pair<List<LibbyLibrary>, Int> {
+        requireWebView().loadUrl(LIBBY_MENU)
+        val rows = waitForMenuLibraryRows()
+        if (rows.isEmpty()) {
+            Log.d(TAG, "detectLinkedLibraries: no libraries on the Menu screen")
+            return emptyList<LibbyLibrary>() to 0
+        }
+        // The selected library is tapped last, so Libby is left with the same library
+        // selected as before, in case tapping a row also selects it.
+        val order = rows.filterNot { it.selected } + rows.filter { it.selected }
+        val keysById = mutableMapOf<String, String>()
+        for ((index, row) in order.withIndex()) {
+            if (index > 0) {
+                // The previous tap left the Menu screen for that library's page.
+                requireWebView().loadUrl(LIBBY_MENU)
+                if (waitForMenuLibraryRows().none { it.id == row.id }) continue
+            }
+            openMenuLibraryAndReadKey(row.id)?.let { keysById[row.id] = it }
+        }
+        val found = rows.mapNotNull { row ->
+            keysById[row.id]?.let { key -> LibbyLibrary(key = key, name = row.name) }
+        }.distinctBy { it.key }
+        Log.d(TAG, "detectLinkedLibraries: ${found.size} of ${rows.size} libraries read")
+        return found to rows.size
+    }
+
+    /**
+     * Waits up to about 8 seconds for the Menu screen's library rows. Only reads them
+     * once the address is the Menu screen's, so rows left over from the page being
+     * replaced (the Library Cards picker uses the same row markup) are never read.
+     */
+    private suspend fun waitForMenuLibraryRows(): List<MenuLibraryRow> {
+        val script = """
+            (() => {
+                const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+                if (!/^\/interview\/menu/.test(location.pathname)) return JSON.stringify([]);
+                const rows = Array.from(document.querySelectorAll('li.summary-list-library[data-item-id]'));
+                return JSON.stringify(rows.map((row) => {
+                    const target = row.querySelector('.summary-list-library-target');
+                    const nameNode = row.querySelector('.summary-list-library-name');
+                    return {
+                        id: row.getAttribute('data-item-id') || '',
+                        name: clean(nameNode ? nameNode.textContent : ''),
+                        selected: !!target && target.getAttribute('aria-current') === 'true',
+                        hasTarget: !!target,
+                    };
+                }).filter((item) => item.id && item.hasTarget));
+            })();
+        """.trimIndent()
+        repeat(20) {
+            delay(400)
+            val rows = evaluateJs(script)?.let { raw ->
+                runCatching {
+                    val array = JSONArray(raw)
+                    (0 until array.length()).map { index ->
+                        val item = array.getJSONObject(index)
+                        MenuLibraryRow(
+                            id = item.optString("id"),
+                            name = item.optString("name"),
+                            selected = item.optBoolean("selected"),
+                        )
+                    }
+                }.getOrNull()
+            }.orEmpty()
+            if (rows.isNotEmpty()) return rows
+        }
+        return emptyList()
+    }
+
+    /**
+     * Taps the Menu row [rowId] and waits up to about 6 seconds for Libby to go to
+     * that library's page, returning the library's key from the address.
+     */
+    private suspend fun openMenuLibraryAndReadKey(rowId: String): String? {
+        val escapedId = rowId.replace("\\", "\\\\").replace("'", "\\'")
+        val clickScript = """
+            (() => {
+                const rows = Array.from(document.querySelectorAll('li.summary-list-library[data-item-id]'));
+                const row = rows.find((r) => r.getAttribute('data-item-id') === '$escapedId');
+                const target = row ? row.querySelector('.summary-list-library-target') : null;
+                if (!target) return 'missing';
+                target.click();
+                return 'clicked';
+            })();
+        """.trimIndent()
+        if (evaluateJs(clickScript) != "clicked") return null
+        repeat(15) {
+            delay(400)
+            val path = evaluateJs("(() => location.pathname)();").orEmpty()
+            LibbyLibrary.keyFromLibraryPath(path)?.let { return it }
+        }
+        return null
+    }
+
     // --- Catalog search & borrow/hold ---------------------------------------------
     //
     // Libby's search results reuse the same `.title-tile` component family as the
@@ -1967,13 +2120,20 @@ object LibbyWebPlayer {
      * page 1 will never see it at all -- even though it's fully findable by scrolling
      * to the next page in a real Libby search.
      *
-     * Every search now needs to be run once per entry in [LIBBY_LIBRARIES] and
-     * merged -- see the search screen's own loop over that list -- since a title
-     * available (or ranked differently) at one linked library is otherwise
-     * invisible if only ever searching a different one.
+     * Every search is run once per library in [LibbyLibraryStore] and merged -- see
+     * the search screen's own loop over that list -- since a title available (or
+     * ranked differently) at one linked library is otherwise invisible if only ever
+     * searching a different one.
+     *
+     * [audiobooksOnly] asks Libby for audiobooks only (see [LibbyLibrary.searchUrl]).
      */
-    fun navigateToSearch(library: LibbyLibrary, query: String, page: Int = 1) {
-        requireWebView().loadUrl(library.searchUrl(query, page))
+    fun navigateToSearch(
+        library: LibbyLibrary,
+        query: String,
+        page: Int = 1,
+        audiobooksOnly: Boolean = true,
+    ) {
+        requireWebView().loadUrl(library.searchUrl(query, page, audiobooksOnly))
     }
 
     /** Scrapes the currently-loaded search results page. Call after [navigateToSearch]
